@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and publish (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;37.0.0"
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Resolve version from tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "::error::'$RELEASE_TAG' is not a release tag (expected e.g. v1.0.0)."
+            exit 1
+          fi
+          echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version consistency
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.value }}"
+          gradle_version="$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -n1)"
+          module_version="$(grep -oP '^version=\K.*' app/src/main/resources/META-INF/xposed/module.prop | tr -d '\r')"
+          if [ "$tag" != "$gradle_version" ] || [ "$tag" != "$module_version" ]; then
+            echo "::error::Tag version (v$tag) does not match versionName ($gradle_version) or module.prop version ($module_version)."
+            exit 1
+          fi
+
+      - name: Build release APK
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.value }}"
+          cp app/build/outputs/apk/release/app-release.apk "LaFix-${version}.apk"
+          sha256sum "LaFix-${version}.apk" > "LaFix-${version}.apk.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: LaFix v${{ steps.version.outputs.value }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            LaFix-${{ steps.version.outputs.value }}.apk
+            LaFix-${{ steps.version.outputs.value }}.apk.sha256

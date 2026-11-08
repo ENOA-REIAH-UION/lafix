@@ -1,0 +1,9 @@
+name=LaFix
+description=修复 ColorOS 在「第三方桌面设为默认 Home」时的返回桌面、任务按钮与智能侧边栏最近应用问题
+author=ENOA-REIAH-UION
+version=1.1.0
+versionCode=6
+minApiVersion=101
+targetApiVersion=102
+staticScope=true
+autoHotReload=false
