@@ -186,3 +186,95 @@ adb logcat | grep -E "onOverviewToggle: use command to response menu|RecentsActi
 - 若系统桌面升级导致方法名 `onOverviewToggle$lambda$12$lambda$8` 变化，Hook 安装失败并记录
   `task-key-dispatch unsupported, skipped`，自动回退原行为，不影响其余修复。
 - 回退方式：删除 `RecentsKeyFixes.install()` 中的 `alignTaskKeyDispatch(scope);` 一行即可。
+
+---
+
+## 7. 从「冷启动应用」进入概览：运行任务缺失导致的自聚焦 / 自跳转
+
+### 7.1 现象
+
+复现：后台保留 c、b（b 更近）→ 回主屏 → 点图标打开此前没有后台任务的应用 a → 在 a 内按任务键。
+
+| 步骤 | 期望 | 实际 |
+| --- | --- | --- |
+| 进入概览 | 聚焦 a 之前那个任务 b | 聚焦第 0 张卡＝a 自身 |
+| 再按任务键 | 跳转到 b | 仍回到 a |
+
+前提：概览卡带顺序为**第 0 张＝最近任务**（`applyLoadPlan()` 的 `attachAndBindChilds()` 自列表末端
+向前装配），所以 a 就是第 0 张、b 是第 1 张。
+
+### 7.2 根因：`mRunningTaskViewId` 停在 -1（实证）
+
+概览的「运行任务」在 `RecentsView.showCurrentTask(Task[],Z)`（`:16727`）里一次性写入：
+
+```java
+mRunningTaskId = -1;
+if (tasks.length == 0 || tasks[0] == null) return;      // ← 提前返回时整个字段不动
+...
+if (shouldAddStubTaskView(tasks)) { ... addViewCompat(..., 0); v4 = 新卡.taskViewId; }
+else { TaskView t = getTaskViewByTaskId(tasks[0].key.id); v4 = t != null ? t.taskViewId : -1; }
+setCurrentTask(v4);                                      // → setRunningTaskViewId(v4)
+```
+
+`tasks` 来自 `AppToOverviewAnimationProvider.onActivityReady()`（`:1884-1906`）：
+`TopTaskTracker.getCachedTopTask(false).getPlaceholderTasks()`，即**当前顶层任务**。
+
+冷启动的应用：其卡片要等最近任务列表加载完（`applyLoadPlan()`）才存在，而 `showCurrentTask()` 在
+`RecentsActivity` 就绪时执行、早于该时刻。于是 `getTaskViewByTaskId(顶层任务 id)` 返回 null，
+`v4 = -1`，`mRunningTaskViewId` 停在 -1。`getTaskViewFromTaskViewId(-1)`（`:10450`）直接返回 null，
+`getRunningTaskView()`（`:9831`）因此恒为 null，**此后没有任何路径重新绑定**。
+
+### 7.3 为什么表现成「自聚焦 + 自跳转」
+
+运行任务缺失时，任务键的跳转与聚焦会同时退化为「第 0 张卡＝a」：
+
+- 跳转：`OplusOverviewCommandHelperImpl.handleLaunchTask()`（`:820-846`）对 fallback 走
+  `OplusRecentsViewImpl.showNextTask()`（`:24290`）。其 `running == null` 分支先试
+  `RecentsViewAnimUtil.getRunningTaskAnimRunning()`——它在概览窗口动画 `onAnimationEnd`
+  （`RecentsActivityCommand$3:81`）已被复位为 -1——于是取 `getTaskViewAt(0)`＝a。
+- 聚焦：本模块 `alignOverviewFocusTarget` 在「无运行任务视图」分支把目标对齐到第 0 页，同样是 a。
+
+两者一致地指向 a，于是「进入概览聚焦自己、再按回到自己」。
+
+### 7.4 处置：惰性纠正 `getRunningTaskView()`
+
+`RecentsKeyFixes#recoverRunningTaskView`：第三方桌面下 hook `RecentsView.getRunningTaskView()`，
+仅在**原值已是 null**、且判定「本次概览是从某个应用（不是桌面）进入」时，返回**第 0 张卡**
+（`getTaskViewAt(0)`）。列表顺序为第 0 张＝最近任务，进入概览的那个应用正是最近任务，所以这张卡
+就是运行任务；此后 `getNextTaskView()`（`= getTaskViewAt(runningIndex + 1)`）、`showNextTask()`
+以及本模块的聚焦目标都会一致地落到第 1 张＝b。
+
+「是否从应用进入」取两道判据之一（都沿用模块既有口径，取或）：
+
+| 判据 | 来源 |
+| --- | --- |
+| 任务键派发入参的**原始**布尔（`SpecialSceneHelper.isOtherFallbackHome(顶层任务, "com.android.launcher")`，true = 顶层是第三方桌面本身） | `alignTaskKeyDispatch` 改写为 true 之前先记入 `sOverviewOpenedFromApp` |
+| 窗口动画来源包名非空且 ≠ 默认 Home 包名 | `RecentsViewAnimUtil.getMWindowAnimationPkg()` + `OverviewComponentObserver.getDefaultHome()`，与 `alignOverviewFocusTarget` 同源 |
+
+从主屏进入时两道判据都为「否」，保持 null → 交回原有行为：聚焦与跳转都落在第 0 张（＝最近打开的
+应用）。任务列表尚未加载、取不到第 0 张卡时同样保持 null，与修复前一致，不会更差。
+
+> 上一版曾按 `TopTaskTracker.getCachedTopTask(false)` 的顶层任务去列表里定位卡片；实测无效——**冷启动
+> 应用的任务尚未进入该缓存**（`getPlaceholderTasks()` 正是 `showCurrentTask()` 当初用来绑定卡片的
+> 同一份数据，它取不到，本 Hook 自然也取不到）。故改按上表两道与具体缓存无关的判据。
+
+### 7.5 验证与回退
+
+```bash
+adb logcat -s LaFix | grep -E "hooked: running-task-recover|running-task-recover:"
+```
+
+`running-task-recover: page 0 used as running task (openedFromApp=…, source=…)` 是本 Hook 生效时的
+单行诊断（同一「标记 + 来源包名」组合只记一次）；若复现时**没有**这一行，说明两道判据都没认定为
+「从应用进入」，问题在判据而不在纠正逻辑。
+
+真机判定（第三方桌面为默认 Home，三键导航）：
+
+| 操作 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 冷启动 a → 应用内按任务键 | 聚焦第 0 张（a） | 聚焦第 1 张（b） |
+| 再按任务键 | 回到 a | 跳转到 b |
+| 主屏按任务键（从桌面进入） | 聚焦 / 跳转第 0 张 | 不变 |
+| 概览里按返回 | 回到打开概览前的应用 | 不变（不受本 Hook 影响） |
+
+回退：删除 `RecentsKeyFixes.install()` 中的 `recoverRunningTaskView(scope);` 一行即可。

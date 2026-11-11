@@ -22,6 +22,15 @@ import java.lang.reflect.Method;
  */
 final class RecentsKeyFixes {
 
+    /**
+     * 最近一次「经任务键打开概览」时，顶层任务是否为第三方桌面本身——即概览是从桌面还是从应用打开的。
+     * 由 alignTaskKeyDispatch 在打开那一次写入（null = 未知），供 recoverRunningTaskView 与诊断日志使用。
+     */
+    private static volatile Boolean sOverviewOpenedFromApp;
+
+    /** 运行任务纠正最近一次实际生效时的签名（记录标记 + 来源包名），仅用于抑制重复日志。 */
+    private static volatile String sRecoveredSignature;
+
     private RecentsKeyFixes() {
     }
 
@@ -34,6 +43,7 @@ final class RecentsKeyFixes {
 
         alignTaskKeyDispatch(scope);
         guardRecentsViewCast(scope);
+        recoverRunningTaskView(scope);
         fixCardInsertionInterpolation(scope);
         alignOverviewFocusTarget(scope);
         fixBackKeyFromOverview(scope);
@@ -88,6 +98,93 @@ final class RecentsKeyFixes {
     }
 
     /**
+     * 症状：从主屏打开一个此前没有后台任务的应用，并在该应用内按任务键进入概览后，聚焦落在应用自身
+     * 那张卡上，再按任务键仍回到它自己（自聚焦、自跳转）。
+     *
+     * 根因：概览的「运行任务」由 RecentsView.showCurrentTask() 在 RecentsActivity 就绪时一次性写入
+     * ——取 TopTaskTracker 的当前顶层任务，再在列表里按 taskId 找卡片。冷启动的应用，其任务卡片要等
+     * 最近任务列表加载完（applyLoadPlan）才存在，而 showCurrentTask 早于该时刻执行，于是
+     * getTaskViewByTaskId() 找不到卡片，mRunningTaskViewId 停在 -1；此后没有任何路径重新绑定它，
+     * 于是 getRunningTaskView() 恒为 null、getRunningTaskIndex() 恒为 -1。
+     *
+     * 运行任务缺失时，跳转与聚焦会同时落到第 0 张卡（＝最新任务＝应用自身）：
+     *   - 跳转：OplusRecentsViewImpl.showNextTask() 取不到运行任务时回退 getTaskViewAt(0)；
+     *   - 聚焦：原厂 getFocusToNextPageTarget() 在 runningTaskIndex == -1 时按 currentPage(0) 取
+     *     getTaskViewAt(0)（非 null）并返回 1，而本模块的 alignOverviewFocusTarget 在「无运行任务
+     *     视图」分支把它改成 0——从主屏进入时这一步正是需要的，从应用进入时却把焦点按回了应用自身。
+     *
+     * 处置：第三方桌面下给 getRunningTaskView() 补一层惰性纠正——原值为 null、且本次概览是从某个
+     * 应用（不是桌面）进入时，返回第 0 张卡。列表顺序为第 0 张＝最新任务，进入概览的那个应用正是
+     * 最新任务，所以这张卡就是运行任务；此后 getNextTaskView()/showNextTask() 与聚焦目标会一致地
+     * 落到第 1 张＝上一个应用。
+     *
+     * 「是否从应用进入」取两道判据之一（沿用模块既有口径）：
+     *   - 任务键派发处记录的原始布尔（顶层是否为第三方桌面），由 alignTaskKeyDispatch 写入；
+     *   - 窗口动画来源包名非空且不等于默认 Home 包名（与 alignOverviewFocusTarget 同源）。
+     *
+     * 从主屏进入时保持 null，交回原有行为（聚焦与跳转都落在第 0 张＝最新打开的应用）。只在原值已是
+     * null 时介入，其余一律直接返回原值。
+     */
+    private static void recoverRunningTaskView(HookScope scope) {
+        scope.install("running-task-recover", () -> {
+            Class<?> recentsView = scope.type(Targets.RECENTS_VIEW);
+            Class<?> observer = scope.type(Targets.OVERVIEW_OBSERVER);
+            Class<?> animationUtil = scope.type(Targets.RECENTS_VIEW_ANIM_UTIL);
+
+            Method otherDesk = scope.otherDesk();
+            Method getRunningTaskView = scope.method(recentsView, "getRunningTaskView");
+            Method getTaskViewAt = scope.method(recentsView, "getTaskViewAt", int.class);
+            Method getDefaultHome = scope.method(observer, "getDefaultHome");
+            Method getWindowAnimationPackage =
+                    scope.method(animationUtil, "getMWindowAnimationPkg");
+            Field animationUtilInstance = scope.field(animationUtil, "INSTANCE");
+
+            scope.hook(getRunningTaskView).intercept(chain -> {
+                Object result = chain.proceed();
+                if (result != null) return result;
+                if (!scope.isThirdPartyHome(otherDesk)) return result;
+                try {
+                    Object animationUtilObject = animationUtilInstance.get(null);
+                    Object sourcePackage = animationUtilObject == null ? null
+                            : getWindowAnimationPackage.invoke(animationUtilObject);
+                    String source = sourcePackage instanceof String ? (String) sourcePackage : null;
+
+                    Boolean openedFromApp = sOverviewOpenedFromApp;
+                    if (!Boolean.TRUE.equals(openedFromApp)
+                            && !fromAppPackage(source, getDefaultHome)) {
+                        return result; // 从主屏进入 → 保持 null，交回原有行为
+                    }
+                    Object card = getTaskViewAt.invoke(chain.getThisObject(), 0);
+                    if (card == null) return result;
+                    logRecovered(openedFromApp, source);
+                    return card;
+                } catch (Throwable ignored) {
+                    return result; // 取值失败 → 保持 null，交回原行为
+                }
+            });
+        });
+    }
+
+    /** 窗口动画来源包名非空且不等于默认 Home 包名 ⟺ 本次概览是从某个应用进入的。 */
+    private static boolean fromAppPackage(String sourcePackage, Method getDefaultHome)
+            throws ReflectiveOperationException {
+        if (sourcePackage == null || sourcePackage.isEmpty()) return false;
+        Object home = getDefaultHome.invoke(null);
+        String homePackage = home instanceof ComponentName
+                ? ((ComponentName) home).getPackageName() : null;
+        return !sourcePackage.equals(homePackage);
+    }
+
+    /** 运行任务纠正生效时的单行诊断，同一组合只记一次，便于真机核对是否命中本分支。 */
+    private static void logRecovered(Boolean openedFromApp, String sourcePackage) {
+        String signature = openedFromApp + "|" + sourcePackage;
+        if (signature.equals(sRecoveredSignature)) return;
+        sRecoveredSignature = signature;
+        Log.i(MainHook.TAG, "running-task-recover: page 0 used as running task ("
+                + "openedFromApp=" + openedFromApp + ", source=" + sourcePackage + ")");
+    }
+
+    /**
      * 任务键派发对齐：概览未展开时冷启动打开，已在前台时保留原厂命令队列。
      *
      * 派发点的分支条件为：
@@ -123,6 +220,12 @@ final class RecentsKeyFixes {
                 // 概览未展开 → 视作顶层是第三方 Home，冷启动打开。
                 Object[] args = chain.getArgs().toArray();
                 if (args.length < 2) return chain.proceed();
+
+                // 入参里的布尔量来自 SpecialSceneHelper.isOtherFallbackHome(顶层任务, "com.android.launcher")：
+                // true = 顶层是第三方桌面本身（本次从主屏打开概览），false = 顶层是应用。
+                // 先按原值记下「从桌面还是从应用打开」，再改写为 true 让它走冷启动分支。
+                sOverviewOpenedFromApp =
+                        args[1] instanceof Boolean ? !((Boolean) args[1]) : null;
                 args[1] = Boolean.TRUE;
                 return chain.proceed(args);
             });
